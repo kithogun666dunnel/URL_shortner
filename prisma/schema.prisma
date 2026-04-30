@@ -11,17 +11,18 @@ model User {
   id        Int      @id @default(autoincrement())
   email     String   @unique
   password  String
-  createdAt DateTime @default(now())
+  createdAt DateTime @default(now()) @db.Timestamptz(3)
   urls      Url[]
 }
 
 model Url {
-  id          Int      @id @default(autoincrement())
+  id          Int       @id @default(autoincrement())
   originalUrl String
-  shortCode   String   @unique
-  createdAt   DateTime @default(now())
+  shortCode   String    @unique
+  createdAt   DateTime  @default(now()) @db.Timestamptz(3)
+  expiresAt   DateTime? @db.Timestamptz(3)
   userId      Int
-  user        User     @relation(fields: [userId], references: [id])
+  user        User      @relation(fields: [userId], references: [id])
   clicks      Click[]
 
   @@index([shortCode])
@@ -30,7 +31,7 @@ model Url {
 model Click {
   id        Int      @id @default(autoincrement())
   urlId     Int
-  timestamp DateTime @default(now())
+  timestamp DateTime @default(now()) @db.Timestamptz(3)
   ip        String
   userAgent String
   url       Url      @relation(fields: [urlId], references: [id])

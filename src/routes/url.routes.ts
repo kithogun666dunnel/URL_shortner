@@ -9,27 +9,61 @@ import { authMiddleware, AuthRequest } from '../middleware/auth';
 
 const router = Router();
 
-const CACHE_TTL_SECONDS = 60 * 60 * 24; // 24 hours
+const CACHE_TTL_SECONDS = 60 * 60 * 24; // 24h
+
+interface CacheEntry {
+  url: string;
+  expiresAt: string | null;
+}
+
+function buildCacheEntry(url: string, expiresAt: Date | null): string {
+  return JSON.stringify({ url, expiresAt: expiresAt?.toISOString() ?? null });
+}
+
+function parseCacheEntry(raw: string): CacheEntry {
+  try {
+    const parsed = JSON.parse(raw) as unknown;
+    if (parsed && typeof parsed === 'object' && 'url' in parsed) {
+      return parsed as CacheEntry;
+    }
+  } catch {}
+  // Legacy plain-string entry — no expiry
+  return { url: raw, expiresAt: null };
+}
+
+function cacheTTL(expiresAt: Date | null): number {
+  if (!expiresAt) return CACHE_TTL_SECONDS;
+  const remaining = Math.floor((expiresAt.getTime() - Date.now()) / 1000);
+  return Math.min(CACHE_TTL_SECONDS, remaining);
+}
 
 // POST /shorten — rate limited + auth + malicious URL check
 router.post('/shorten', rateLimiter, authMiddleware, async (req: AuthRequest, res: Response) => {
-  const { url } = req.body as { url?: string };
+  const { url, ttlSeconds } = req.body as { url?: string; ttlSeconds?: unknown };
 
   if (!url || typeof url !== 'string') {
     res.status(400).json({ error: 'url is required' });
     return;
   }
 
-  // Malicious URL validation
   const validation = validateUrl(url);
   if (!validation.valid) {
     res.status(400).json({ error: validation.reason });
     return;
   }
 
+  let expiresAt: Date | null = null;
+  if (ttlSeconds !== undefined) {
+    if (!Number.isInteger(ttlSeconds) || (ttlSeconds as number) < 60) {
+      res.status(400).json({ error: 'ttlSeconds must be an integer >= 60' });
+      return;
+    }
+    expiresAt = new Date(Date.now() + (ttlSeconds as number) * 1000);
+  }
+
   try {
     const record = await prisma.url.create({
-      data: { originalUrl: url, shortCode: '', userId: req.userId! },
+      data: { originalUrl: url, shortCode: '', userId: req.userId!, expiresAt },
     });
 
     const shortCode = encodeBase62(record.id);
@@ -38,13 +72,14 @@ router.post('/shorten', rateLimiter, authMiddleware, async (req: AuthRequest, re
       data: { shortCode },
     });
 
-    // Warm cache on create — first redirect is always a cache hit
-    await redis.set(`url:${shortCode}`, updated.originalUrl, 'EX', CACHE_TTL_SECONDS);
+    const ttl = cacheTTL(updated.expiresAt);
+    await redis.set(`url:${shortCode}`, buildCacheEntry(updated.originalUrl, updated.expiresAt), 'EX', ttl);
 
     res.status(201).json({
       shortCode: updated.shortCode,
       shortUrl: `${req.protocol}://${req.get('host')}/${updated.shortCode}`,
       originalUrl: updated.originalUrl,
+      expiresAt: updated.expiresAt ?? null,
     });
   } catch (err) {
     console.error('[POST /shorten]', err);
@@ -52,7 +87,56 @@ router.post('/shorten', rateLimiter, authMiddleware, async (req: AuthRequest, re
   }
 });
 
-// GET /:code/stats — auth required, returns click analytics
+// GET /my/urls — paginated list of caller's URLs with click counts
+router.get('/my/urls', authMiddleware, async (req: AuthRequest, res: Response) => {
+  const rawLimit = parseInt(req.query.limit as string, 10);
+  const limit = Number.isFinite(rawLimit) && rawLimit > 0 ? Math.min(rawLimit, 50) : 10;
+  const rawCursor = parseInt(req.query.cursor as string, 10);
+  const cursor = Number.isFinite(rawCursor) && rawCursor > 0 ? rawCursor : undefined;
+
+  try {
+    const rows = await prisma.url.findMany({
+      where: {
+        userId: req.userId!,
+        ...(cursor !== undefined ? { id: { lt: cursor } } : {}),
+      },
+      orderBy: { id: 'desc' },
+      take: limit + 1,
+      select: {
+        id: true,
+        shortCode: true,
+        originalUrl: true,
+        createdAt: true,
+        expiresAt: true,
+        _count: { select: { clicks: true } },
+      },
+    });
+
+    const hasMore = rows.length > limit;
+    const page = hasMore ? rows.slice(0, limit) : rows;
+    const nextCursor = hasMore ? page[page.length - 1].id : null;
+    const host = `${req.protocol}://${req.get('host')}`;
+
+    res.json({
+      urls: page.map((r) => ({
+        id: r.id,
+        shortCode: r.shortCode,
+        shortUrl: `${host}/${r.shortCode}`,
+        originalUrl: r.originalUrl,
+        createdAt: r.createdAt,
+        expiresAt: r.expiresAt ?? null,
+        clickCount: r._count.clicks,
+      })),
+      nextCursor,
+      hasMore,
+    });
+  } catch (err) {
+    console.error('[GET /my/urls]', err);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// GET /:code/stats — auth required, ownership-gated
 router.get('/:code/stats', authMiddleware, async (req: AuthRequest, res: Response) => {
   const { code } = req.params;
 
@@ -73,7 +157,6 @@ router.get('/:code/stats', authMiddleware, async (req: AuthRequest, res: Respons
     }
 
     const totalClicks = record.clicks.length;
-
     const uniqueIPs = new Set(record.clicks.map((c) => c.ip)).size;
 
     const uaCounts: Record<string, number> = {};
@@ -88,6 +171,7 @@ router.get('/:code/stats', authMiddleware, async (req: AuthRequest, res: Respons
     res.json({
       shortCode: code,
       originalUrl: record.originalUrl,
+      expiresAt: record.expiresAt ?? null,
       totalClicks,
       uniqueIPs,
       topUserAgents,
@@ -98,42 +182,45 @@ router.get('/:code/stats', authMiddleware, async (req: AuthRequest, res: Respons
   }
 });
 
-// GET /:code — Redis-first lookup + async analytics
+// GET /:code — Redis-first redirect, expiry-aware
 router.get('/:code', async (req: Request, res: Response) => {
   const { code } = req.params;
   const cacheKey = `url:${code}`;
 
   try {
-    // 1. Cache hit
-    const cached = await redis.get(cacheKey);
-    if (cached) {
-      // Fire-and-forget — do NOT await, must not block redirect
-      // We need urlId for Click record; cache only stores originalUrl.
-      // Look up urlId async alongside the enqueue (non-blocking path).
-      enqueueClick(code, req).catch(() => {}); // swallow errors — analytics is non-critical
-      res.redirect(301, cached);
+    const raw = await redis.get(cacheKey);
+    if (raw) {
+      const entry = parseCacheEntry(raw);
+      if (entry.expiresAt && new Date(entry.expiresAt) <= new Date()) {
+        await redis.del(cacheKey);
+        res.status(410).json({ error: 'This link has expired' });
+        return;
+      }
+      enqueueClick(code, req).catch(() => {});
+      res.redirect(301, entry.url);
       return;
     }
 
-    // 2. Cache miss — hit DB
-    const record = await prisma.url.findUnique({
-      where: { shortCode: code },
-    });
+    const record = await prisma.url.findUnique({ where: { shortCode: code } });
 
     if (!record) {
       res.status(404).json({ error: 'Short URL not found' });
       return;
     }
 
-    // 3. Populate cache
-    await redis.set(cacheKey, record.originalUrl, 'EX', CACHE_TTL_SECONDS);
+    if (record.expiresAt && record.expiresAt <= new Date()) {
+      res.status(410).json({ error: 'This link has expired' });
+      return;
+    }
 
-    // Fire-and-forget analytics
+    const ttl = cacheTTL(record.expiresAt);
+    await redis.set(cacheKey, buildCacheEntry(record.originalUrl, record.expiresAt), 'EX', ttl);
+
     analyticsQueue.add('click', {
       urlId: record.id,
       ip: req.ip ?? 'unknown',
       userAgent: req.headers['user-agent'] ?? 'unknown',
-    }).catch(() => {}); // swallow — analytics must never break redirect
+    }).catch(() => {});
 
     res.redirect(301, record.originalUrl);
   } catch (err) {
@@ -142,14 +229,12 @@ router.get('/:code', async (req: Request, res: Response) => {
   }
 });
 
-// Resolves urlId from DB (cheap: indexed lookup) then enqueues — used on cache-hit path
 async function enqueueClick(code: string, req: Request): Promise<void> {
   const record = await prisma.url.findUnique({
     where: { shortCode: code },
     select: { id: true },
   });
   if (!record) return;
-
   await analyticsQueue.add('click', {
     urlId: record.id,
     ip: req.ip ?? 'unknown',

@@ -1,3 +1,7 @@
 node_modules/
 dist/
 .env
+.claude/
+redis-bin/*.bak
+redis-bin/*.zip
+redis-bin/redis5-extracted/
